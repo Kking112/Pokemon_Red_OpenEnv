@@ -1,8 +1,8 @@
 ---
 title: Pokemonred Env Environment Server
-emoji: 🖼️
-colorFrom: green
-colorTo: yellow
+emoji: 🔈
+colorFrom: red
+colorTo: red
 sdk: docker
 pinned: false
 app_port: 8000
