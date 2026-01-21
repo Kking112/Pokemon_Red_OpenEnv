@@ -4,60 +4,76 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Multi-stage build using openenv-base
-# This Dockerfile is flexible and works for both:
-# - In-repo environments (with local OpenEnv sources)
-# - Standalone environments (with openenv from PyPI/Git)
-# The build script (openenv build) handles context detection and sets appropriate build args.
+# Multi-stage build for Pokemon Red OpenEnv
+# Builds a containerized PyBoy emulator environment for RL training
+#
+# Build: openenv build
+# Run:   docker run -p 8000:8000 pokemonred-env:latest
+#
+# Environment variables:
+#   POKEMON_HEADLESS: Run without display (default: true)
+#   POKEMON_ACTION_FREQ: Emulator ticks per action (default: 24)
+#   POKEMON_ROM_PATH: Path to ROM file (default: /app/env/server/PokemonRed.gb)
+#   POKEMON_INIT_STATE: Path to save state (default: /app/env/server/init.state)
 
 ARG BASE_IMAGE=ghcr.io/meta-pytorch/openenv-base:latest
 FROM ${BASE_IMAGE} AS builder
 
 WORKDIR /app
 
-# Ensure git is available (required for installing dependencies from VCS)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends git && \
-    rm -rf /var/lib/apt/lists/*
+# Install build dependencies for PyBoy and SDL2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    build-essential \
+    libsdl2-dev \
+    libsdl2-image-dev \
+    libsdl2-mixer-dev \
+    libsdl2-ttf-dev \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Build argument to control whether we're building standalone or in-repo
+# Build arguments
 ARG BUILD_MODE=in-repo
 ARG ENV_NAME=pokemonred_env
 
-# Copy environment code (always at root of build context)
+# Copy environment code
 COPY . /app/env
 
-# For in-repo builds, openenv is already vendored in the build context
-# For standalone builds, openenv will be installed via pyproject.toml
 WORKDIR /app/env
 
-# Ensure uv is available (for local builds where base image lacks it)
+# Ensure uv is available
 RUN if ! command -v uv >/dev/null 2>&1; then \
-        curl -LsSf https://astral.sh/uv/install.sh | sh && \
-        mv /root/.local/bin/uv /usr/local/bin/uv && \
-        mv /root/.local/bin/uvx /usr/local/bin/uvx; \
+    curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    mv /root/.local/bin/uv /usr/local/bin/uv && \
+    mv /root/.local/bin/uvx /usr/local/bin/uvx; \
     fi
-    
+
 # Install dependencies using uv sync
-# If uv.lock exists, use it; otherwise resolve on the fly
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ -f uv.lock ]; then \
-        uv sync --frozen --no-install-project --no-editable; \
+    uv sync --frozen --no-install-project --no-editable; \
     else \
-        uv sync --no-install-project --no-editable; \
+    uv sync --no-install-project --no-editable; \
     fi
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ -f uv.lock ]; then \
-        uv sync --frozen --no-editable; \
+    uv sync --frozen --no-editable; \
     else \
-        uv sync --no-editable; \
+    uv sync --no-editable; \
     fi
 
 # Final runtime stage
 FROM ${BASE_IMAGE}
 
 WORKDIR /app
+
+# Install runtime dependencies for PyBoy headless operation
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsdl2-2.0-0 \
+    libsdl2-image-2.0-0 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy the virtual environment from builder
 COPY --from=builder /app/env/.venv /app/.venv
@@ -68,13 +84,30 @@ COPY --from=builder /app/env /app/env
 # Set PATH to use the virtual environment
 ENV PATH="/app/.venv/bin:$PATH"
 
-# Set PYTHONPATH so imports work correctly
+# Set PYTHONPATH for imports
 ENV PYTHONPATH="/app/env:$PYTHONPATH"
 
+# Configure SDL for headless operation (no display, no audio)
+ENV SDL_VIDEODRIVER=dummy
+ENV SDL_AUDIODRIVER=dummy
+
+# Default environment configuration
+ENV POKEMON_HEADLESS=true
+ENV POKEMON_ACTION_FREQ=24
+ENV POKEMON_ROM_PATH=/app/env/server/PokemonRed.gb
+ENV POKEMON_INIT_STATE=/app/env/server/init.state
+ENV POKEMON_MAX_STEPS=163840
+ENV POKEMON_SESSION_PATH=/tmp/pokemon_sessions
+
+# Create session directory
+RUN mkdir -p /tmp/pokemon_sessions
+
 # Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
+# Expose port
+EXPOSE 8000
+
 # Run the FastAPI server
-# The module path is constructed to work with the /app/env structure
 CMD ["sh", "-c", "cd /app/env && uvicorn server.app:app --host 0.0.0.0 --port 8000"]

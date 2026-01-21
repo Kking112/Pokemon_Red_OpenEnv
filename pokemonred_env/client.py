@@ -4,74 +4,95 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Pokemonred Env Environment Client."""
+"""
+Pokemon Red Environment Client.
 
-from typing import Dict
+This module provides the client for connecting to a Pokemon Red Environment server
+via WebSocket for persistent sessions.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, TYPE_CHECKING
 
 from openenv.core.client_types import StepResult
-from openenv.core.env_server.types import State
-from openenv.core import EnvClient
+from openenv.core.env_client import EnvClient
 
-from .models import PokemonredAction, PokemonredObservation
+from .models import PokemonRedAction, PokemonRedObservation, PokemonRedState
+
+if TYPE_CHECKING:
+    from openenv.core.containers.runtime import ContainerProvider
 
 
-class PokemonredEnv(
-    EnvClient[PokemonredAction, PokemonredObservation]
-):
+class PokemonRedEnv(EnvClient[PokemonRedAction, PokemonRedObservation, PokemonRedState]):
     """
-    Client for the Pokemonred Env Environment.
+    Client for Pokemon Red Environment.
 
-    This client maintains a persistent WebSocket connection to the environment server,
-    enabling efficient multi-step interactions with lower latency.
-    Each client instance has its own dedicated environment session on the server.
+    This client maintains a persistent WebSocket connection to the environment
+    server, enabling efficient multi-step interactions with lower latency.
 
     Example:
         >>> # Connect to a running server
-        >>> with PokemonredEnv(base_url="http://localhost:8000") as client:
+        >>> with PokemonRedEnv(base_url="http://localhost:8000") as client:
         ...     result = client.reset()
-        ...     print(result.observation.echoed_message)
+        ...     print(result.observation.screen_shape)
         ...
-        ...     result = client.step(PokemonredAction(message="Hello!"))
-        ...     print(result.observation.echoed_message)
+        ...     result = client.step(PokemonRedAction(action=4))  # Press A
+        ...     print(result.reward, result.done)
 
     Example with Docker:
         >>> # Automatically start container and connect
-        >>> client = PokemonredEnv.from_docker_image("pokemonred_env-env:latest")
+        >>> client = PokemonRedEnv.from_docker_image("pokemonred-env:latest")
         >>> try:
         ...     result = client.reset()
-        ...     result = client.step(PokemonredAction(message="Test"))
+        ...     result = client.step(PokemonRedAction(action=0))  # Press Down
         ... finally:
         ...     client.close()
+
+    Example from HuggingFace Hub:
+        >>> # Connect to hosted environment
+        >>> client = PokemonRedEnv.from_hub("openenv/pokemonred")
+        >>> with client:
+        ...     result = client.reset()
+        ...     for _ in range(100):
+        ...         action = PokemonRedAction(action=random.randint(0, 6))
+        ...         result = client.step(action)
     """
 
-    def _step_payload(self, action: PokemonredAction) -> Dict:
+    def _step_payload(self, action: PokemonRedAction) -> Dict[str, Any]:
         """
-        Convert PokemonredAction to JSON payload for step message.
+        Convert PokemonRedAction to JSON payload for step request.
 
         Args:
-            action: PokemonredAction instance
+            action: PokemonRedAction instance.
 
         Returns:
-            Dictionary representation suitable for JSON encoding
+            Dictionary representation suitable for JSON encoding.
         """
-        return {
-            "message": action.message,
-        }
+        return {"action": action.action}
 
-    def _parse_result(self, payload: Dict) -> StepResult[PokemonredObservation]:
+    def _parse_result(self, payload: Dict[str, Any]) -> StepResult[PokemonRedObservation]:
         """
-        Parse server response into StepResult[PokemonredObservation].
+        Parse server response into StepResult[PokemonRedObservation].
 
         Args:
-            payload: JSON response data from server
+            payload: JSON response from server.
 
         Returns:
-            StepResult with PokemonredObservation
+            StepResult with PokemonRedObservation.
         """
         obs_data = payload.get("observation", {})
-        observation = PokemonredObservation(
-            echoed_message=obs_data.get("echoed_message", ""),
-            message_length=obs_data.get("message_length", 0),
+
+        observation = PokemonRedObservation(
+            screen_b64=obs_data.get("screen_b64", ""),
+            screen_shape=obs_data.get("screen_shape", [144, 160, 3]),
+            health=obs_data.get("health", 0.0),
+            level_sum=obs_data.get("level_sum", 0),
+            badges=obs_data.get("badges", [0] * 8),
+            position=obs_data.get("position", [0, 0, 0]),
+            in_battle=obs_data.get("in_battle", False),
+            seen_coords_count=obs_data.get("seen_coords_count", 0),
+            legal_actions=obs_data.get("legal_actions", list(range(7))),
             done=payload.get("done", False),
             reward=payload.get("reward"),
             metadata=obs_data.get("metadata", {}),
@@ -83,17 +104,22 @@ class PokemonredEnv(
             done=payload.get("done", False),
         )
 
-    def _parse_state(self, payload: Dict) -> State:
+    def _parse_state(self, payload: Dict[str, Any]) -> PokemonRedState:
         """
-        Parse server response into State object.
+        Parse server response into PokemonRedState object.
 
         Args:
-            payload: JSON response from state request
+            payload: JSON response from /state endpoint.
 
         Returns:
-            State object with episode_id and step_count
+            PokemonRedState object with environment state information.
         """
-        return State(
+        return PokemonRedState(
             episode_id=payload.get("episode_id"),
             step_count=payload.get("step_count", 0),
+            total_reward=payload.get("total_reward", 0.0),
+            reset_count=payload.get("reset_count", 0),
+            badges_obtained=payload.get("badges_obtained", 0),
+            max_level_sum=payload.get("max_level_sum", 0),
+            events_triggered=payload.get("events_triggered", 0),
         )
