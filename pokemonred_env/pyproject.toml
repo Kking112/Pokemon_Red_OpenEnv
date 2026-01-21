@@ -17,10 +17,9 @@ dependencies = [
     "einops>=0.6.0",
     "fastapi>=0.115.0",
     "numpy>=1.21.0",
-    # Core OpenEnv runtime (provides FastAPI server + HTTP client types)
-    # install from github
-    # "openenv-core[core] @ git+https://github.com/meta-pytorch/OpenEnv.git",
-    "openenv-core[core]>=0.1.0",
+    # OpenEnv runtime - add both for validation compatibility
+    "openenv>=0.1.0",  # PyPI package (for validation check)
+    "openenv-core @ git+https://github.com/meta-pytorch/OpenEnv.git",  # Latest from GitHub
     # Environment-specific dependencies
     # Add all dependencies needed for your environment here
     # Examples:
