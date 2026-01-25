@@ -1,238 +1,325 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """
-src/envs/pokemon_red/server/env.py
---------------------------------
-Core Pokemon Red environment logic ported to OpenEnv.
+Pokemon Red Environment Server Implementation.
+
+This module wraps the PyBoy Game Boy emulator and exposes Pokemon Red
+as an OpenEnv Environment for RL training.
 """
-import json
-import uuid
+
+from __future__ import annotations
+
 import base64
+import io
+import uuid
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional, List
+from typing import Any, Dict, List, Tuple
+
 import numpy as np
 from PIL import Image
-from pyboy import PyBoy
-from pyboy.utils import WindowEvent
-from einops import repeat
 
-from core.env_server import Environment, Transform
-from pokemonred_env.models import PokemonRedAction, PokemonRedObservation, PokemonRedState
-from pokemonred_env.config import PokemonRedConfig
-from pokemonred_env.rewards.manager import RewardManager
+try:
+    from pyboy import PyBoy
+    from pyboy.utils import WindowEvent
+except ImportError as e:
+    raise ImportError(
+        "PyBoy is required for the Pokemon Red environment. "
+        "Install with: pip install pyboy"
+    ) from e
+
+from openenv.core.env_server import Environment
+from openenv.core.env_server.types import Action, Observation
+
+from models import PokemonRedAction, PokemonRedObservation, PokemonRedState
+from config import PokemonRedConfig
 from .global_map import local_to_global, GLOBAL_MAP_SHAPE
 
-# Memory addresses (Constants)
+# Memory addresses for Pokemon Red
 EVENT_FLAGS_START = 0xD747
 EVENT_FLAGS_END = 0xD87E
-MUSEUM_TICKET = (0xD754, 0)
-TILEMAP_START = 0xC3A0
-TILEMAP_SIZE = 360
-TILEMAP_WIDTH = 20
-TILEMAP_HEIGHT = 18
-TEXT_BOX_ID_ADDR = 0xD125
 IS_IN_BATTLE_ADDR = 0xD057
 
-# Character Map
-POKEMON_CHARMAP = {
-    0x50: '', 0x4F: '\n', 0x7F: ' ',
-    **{0x80 + i: chr(ord('A') + i) for i in range(26)},
-    **{0xA0 + i: chr(ord('a') + i) for i in range(26)},
-    **{0xF6 + i: str(i) for i in range(10)},
-    0xE3: '-', 0xE6: '?', 0xE7: '!', 0xE8: '.',
-    0xEF: '♂', 0xF5: '♀', 0xBA: ':', 0xE0: "'",
-    0x9C: '(', 0x9D: ')', 0xE1: 'PK', 0xE2: 'MN',
-    0x75: '...', 0xF4: ',', 0xF3: '/', 0xF1: '*', 0xF2: '*',
-}
-TEXT_BOX_BORDER_TILES = {0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x6F}
+# Party Pokemon HP addresses
+HP_ADDRESSES = [0xD16C, 0xD198, 0xD1C4, 0xD1F0, 0xD21C, 0xD248]
+MAX_HP_ADDRESSES = [0xD18D, 0xD1B9, 0xD1E5, 0xD211, 0xD23D, 0xD269]
+LEVEL_ADDRESSES = [0xD18C, 0xD1B8, 0xD1E4, 0xD210, 0xD23C, 0xD268]
 
-class PokemonRedEnv(Environment):
 
-    # Enable concurrent WebSocket sessions.
-    # Set to True if your environment isolates state between instances.
-    # When True, multiple WebSocket clients can connect simultaneously, each
-    # getting their own environment instance (when using factory mode in app.py).
+class PokemonRedEnvironment(Environment):
+    """
+    Pokemon Red Environment wrapper for OpenEnv.
+
+    This environment wraps Pokemon Red via PyBoy emulator and provides
+    a clean interface for RL training with rich observations and
+    configurable reward shaping.
+
+    Supported actions: 0=Down, 1=Left, 2=Right, 3=Up, 4=A, 5=B, 6=Start
+
+    Args:
+        config: PokemonRedConfig with environment settings.
+
+    Example:
+        >>> config = PokemonRedConfig(headless=True)
+        >>> env = PokemonRedEnvironment(config)
+        >>> obs = env.reset()
+        >>> obs = env.step(PokemonRedAction(action=4))  # Press A
+    """
+
+    # Enable concurrent WebSocket sessions
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
-    def __init__(self, config: PokemonRedConfig, transform: Transform | None = None):
-        super().__init__(transform)
+    # Action mappings
+    VALID_ACTIONS = [
+        WindowEvent.PRESS_ARROW_DOWN,
+        WindowEvent.PRESS_ARROW_LEFT,
+        WindowEvent.PRESS_ARROW_RIGHT,
+        WindowEvent.PRESS_ARROW_UP,
+        WindowEvent.PRESS_BUTTON_A,
+        WindowEvent.PRESS_BUTTON_B,
+        WindowEvent.PRESS_BUTTON_START,
+    ]
+    RELEASE_ACTIONS = [
+        WindowEvent.RELEASE_ARROW_DOWN,
+        WindowEvent.RELEASE_ARROW_LEFT,
+        WindowEvent.RELEASE_ARROW_RIGHT,
+        WindowEvent.RELEASE_ARROW_UP,
+        WindowEvent.RELEASE_BUTTON_A,
+        WindowEvent.RELEASE_BUTTON_B,
+        WindowEvent.RELEASE_BUTTON_START,
+    ]
+    ACTION_NAMES = ["Down", "Left", "Right", "Up", "A", "B", "Start"]
+
+    def __init__(self, config: PokemonRedConfig):
+        """Initialize Pokemon Red environment."""
+        super().__init__()
         self.config = config
-        self.reward_manager = RewardManager(config.dict())
-        self._state = PokemonRedState()
-        # Paths
+        
+        # Initialize state
+        self._state = PokemonRedState(episode_id=str(uuid.uuid4()))
+        
+        # Session path for saving states
         self.session_path = Path(config.session_path)
         self.session_path.mkdir(exist_ok=True, parents=True)
-        
-        # Emulator - disable sound to prevent buffer overrun in headless mode
-        head = "null" if config.headless else "SDL2"
+
+        # Initialize PyBoy emulator
+        window_type = "null" if config.headless else "SDL2"
         self.pyboy = PyBoy(
             config.gb_path,
-            window=head,
-            sound_emulated=False  # Disable sound to prevent buffer overrun errors.. furthermore sound is not needed for anything
+            window=window_type,
+            sound_emulated=False,  # Disable sound for headless operation
         )
         if not config.headless:
             self.pyboy.set_emulation_speed(6)
-            
-        # State tracking
-        self.recent_actions = np.zeros((config.frame_stacks,), dtype=np.uint8)
-        self.seen_coords = {}
+
+        # Tracking state
+        self.seen_coords: Dict[str, int] = {}
         self.explore_map = np.zeros(GLOBAL_MAP_SHAPE, dtype=np.uint8)
-        self.coords_pad = 12
-        self.step_count = 0
-        self.total_reward = 0.0
-        self.reset_count = 0
-        self.action_names = ["Down", "Left", "Right", "Up", "A", "B", "Start"]
-        
-        # Actions
-        self.valid_actions = [
-            WindowEvent.PRESS_ARROW_DOWN, WindowEvent.PRESS_ARROW_LEFT, WindowEvent.PRESS_ARROW_RIGHT,
-            WindowEvent.PRESS_ARROW_UP, WindowEvent.PRESS_BUTTON_A, WindowEvent.PRESS_BUTTON_B,
-            WindowEvent.PRESS_BUTTON_START,
-        ]
-        self.release_actions = [
-            WindowEvent.RELEASE_ARROW_DOWN, WindowEvent.RELEASE_ARROW_LEFT, WindowEvent.RELEASE_ARROW_RIGHT,
-            WindowEvent.RELEASE_ARROW_UP, WindowEvent.RELEASE_BUTTON_A, WindowEvent.RELEASE_BUTTON_B,
-            WindowEvent.RELEASE_BUTTON_START,
-        ]
+        self._prev_state_dict: Dict[str, Any] = {}
+
+    def reset(self) -> Observation:
+        """
+        Reset the environment and return initial observation.
+
+        Returns:
+            Initial PokemonRedObservation for the agent.
+        """
+        # Reset state tracking
+        self._state = PokemonRedState(episode_id=str(uuid.uuid4()))
+        self.seen_coords = {}
+        self.explore_map.fill(0)
+        self._prev_state_dict = {}
+
+        # Load initial save state
+        with open(self.config.init_state, "rb") as f:
+            self.pyboy.load_state(f)
+
+        # Tick once to render initial frame
+        self.pyboy.tick(1, True)
+
+        return self._make_observation(reward=0.0, done=False)
+
+    def step(self, action: Action) -> Observation:
+        """
+        Execute agent's action and return resulting observation.
+
+        Args:
+            action: PokemonRedAction containing the button to press.
+
+        Returns:
+            Observation after action execution.
+
+        Raises:
+            ValueError: If action is not a PokemonRedAction.
+        """
+        if not isinstance(action, PokemonRedAction):
+            raise ValueError(f"Expected PokemonRedAction, got {type(action)}")
+
+        # Validate action
+        action_idx = action.action
+        if action_idx < 0 or action_idx >= len(self.VALID_ACTIONS):
+            raise ValueError(f"Invalid action: {action_idx}. Valid range: [0, 6]")
+
+        # Execute action with press/release timing
+        press_duration = 8
+        self.pyboy.send_input(self.VALID_ACTIONS[action_idx])
+        self.pyboy.tick(press_duration, False)
+        self.pyboy.send_input(self.RELEASE_ACTIONS[action_idx])
+        self.pyboy.tick(self.config.action_freq - press_duration - 1, False)
+        self.pyboy.tick(1, True)  # Render on final tick
+
+        # Update exploration tracking
+        self._update_exploration()
+
+        # Calculate reward
+        current_state = self._get_state_dict()
+        reward = self._calculate_reward(current_state, self._prev_state_dict)
+        self._prev_state_dict = current_state
+
+        # Update state
+        self._state.step_count += 1
+        self._state.total_reward += reward
+        self._state.badges_obtained = current_state["badge_count"]
+        self._state.max_level_sum = max(
+            self._state.max_level_sum, current_state["level_sum"]
+        )
+        self._state.events_triggered = current_state["event_count"]
+
+        # Check termination
+        done = self._state.step_count >= self.config.max_steps
+
+        return self._make_observation(reward=reward, done=done)
 
     @property
     def state(self) -> PokemonRedState:
+        """Get current environment state."""
         return self._state
 
-    def reset(self) -> PokemonObservation:
-        self._state = PokemonRedState()
-        # Load state
-        with open(self.config.init_state, "rb") as f:
-            self.pyboy.load_state(f)
-            
-        # Reset trackers
-        self.seen_coords = {}
-        self.explore_map.fill(0)
-        self.recent_actions.fill(0)
-        self.step_count = 0
-        self.total_reward = 0.0
-        self.reset_count += 1
-        self.reward_manager.reset()
-        
-        return self._get_obs()
+    def _make_observation(self, reward: float, done: bool) -> PokemonRedObservation:
+        """Create observation from current game state."""
+        # Capture screen as base64 PNG
+        screen = self.pyboy.screen.ndarray[:, :, :3].astype(np.uint8)
+        img = Image.fromarray(screen)
+        buffer = io.BytesIO()
+        img.save(buffer, format="PNG")
+        screen_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-    def step(self, action: PokemonAction) -> PokemonObservation:
-        # Resolve action
-        act_idx = action.action
-        
-        self.pyboy.send_input(self.valid_actions[act_idx])
-        press_step = 8
-        self.pyboy.tick(press_step, False) # Do not render every tick for performance
-        self.pyboy.send_input(self.release_actions[act_idx])
-        self.pyboy.tick(self.config.action_freq - press_step - 1, False)
-        self.pyboy.tick(1, True) # Render on last tick
-        
-        # Update trackers
-        self._update_recent_actions(act_idx)
-        self._update_exploration()
-        
-        # Calc Reward
-        state_dict = self._get_state_dict()
-        reward = self.reward_manager.update(state_dict)
-        self.total_reward += reward
-        self.step_count += 1
-        self._state.step_count = self.step_count
-        
-        return self._get_obs()
+        # Read game state
+        x, y, map_id = self._get_position()
+        health = self._get_hp_fraction()
+        level_sum = self._get_level_sum()
+        badges = self._get_badges_list()
+        in_battle = self._is_in_battle()
 
-    def _get_obs(self) -> PokemonObservation:
-        screen_arr = self.pyboy.screen.ndarray[:, :, :3].astype(np.uint8)
-        # Convert to base64 for transport if needed, or keep raw. 
-        # OpenEnv typically expects serializable JSON. 
-        # We will use a simplified dict representation for now.
-        import io
-        img = Image.fromarray(screen_arr)
-        bio = io.BytesIO()
-        img.save(bio, format="PNG")
-        b64_img = base64.b64encode(bio.getvalue()).decode("utf-8")
-        
-        return PokemonObservation(
-            screen={"b64": b64_img, "shape": list(screen_arr.shape)},
-            health=[self._read_hp_fraction()],
-            level=[float(x) for x in self._fourier_encode(self._get_levels_sum())],
-            badges=self._get_badges_binary(),
-            events=self._read_event_bits(),
-            map=self._get_explore_map().tolist(),
-            recent_actions=self.recent_actions.tolist(),
-            in_battle=1 if self._is_in_battle() else 0,
-            position=list(self._get_game_coords()),
-            has_text=1 if self._has_active_text() else 0,
-            game_text_raw=self._read_tilemap_raw().tolist()
+        return PokemonRedObservation(
+            screen_b64=screen_b64,
+            screen_shape=list(screen.shape),
+            health=health,
+            level_sum=level_sum,
+            badges=badges,
+            position=[x, y, map_id],
+            in_battle=in_battle,
+            seen_coords_count=len(self.seen_coords),
+            legal_actions=list(range(7)),
+            done=done,
+            reward=reward,
+            metadata={
+                "action_names": self.ACTION_NAMES,
+                "step_count": self._state.step_count,
+                "total_reward": self._state.total_reward,
+            },
         )
 
-    # --- Helpers ---
-    def _update_recent_actions(self, action: int):
-        self.recent_actions = np.roll(self.recent_actions, 1)
-        self.recent_actions[0] = action
+    def _get_position(self) -> Tuple[int, int, int]:
+        """Get player position (x, y, map_id)."""
+        return (
+            self.pyboy.memory[0xD362],
+            self.pyboy.memory[0xD361],
+            self.pyboy.memory[0xD35E],
+        )
 
-    def _get_game_coords(self) -> Tuple[int, int, int]:
-        return (self.pyboy.memory[0xD362], self.pyboy.memory[0xD361], self.pyboy.memory[0xD35E])
+    def _update_exploration(self) -> None:
+        """Update exploration tracking with current position."""
+        x, y, map_id = self._get_position()
+        coord_key = f"{x}:{y}:{map_id}"
+        self.seen_coords[coord_key] = self.seen_coords.get(coord_key, 0) + 1
 
-    def _update_exploration(self):
-        x, y, map_n = self._get_game_coords()
-        # Local
-        coord_string = f"x:{x} y:{y} m:{map_n}"
-        self.seen_coords[coord_string] = self.seen_coords.get(coord_string, 0) + 1
-        # Global map
-        gx, gy = local_to_global(y, x, map_n)
-        if gx < GLOBAL_MAP_SHAPE[0] and gy < GLOBAL_MAP_SHAPE[1]:
+        # Update global exploration map
+        gx, gy = local_to_global(y, x, map_id)
+        if 0 <= gx < GLOBAL_MAP_SHAPE[0] and 0 <= gy < GLOBAL_MAP_SHAPE[1]:
             self.explore_map[gx, gy] = 255
 
-    def _read_hp_fraction(self) -> float:
-        # Simplified for brevity - assume party leader or sum
-        # Using the same logic as reference
-        hp_sum = sum(self._read_hp(a) for a in [0xD16C, 0xD198, 0xD1C4, 0xD1F0, 0xD21C, 0xD248])
-        max_hp_sum = sum(self._read_hp(a) for a in [0xD18D, 0xD1B9, 0xD1E5, 0xD211, 0xD23D, 0xD269])
+    def _get_hp_fraction(self) -> float:
+        """Get party HP as fraction [0, 1]."""
+        hp_sum = sum(self._read_hp(addr) for addr in HP_ADDRESSES)
+        max_hp_sum = sum(self._read_hp(addr) for addr in MAX_HP_ADDRESSES)
         return hp_sum / max(max_hp_sum, 1)
 
-    def _read_hp(self, start: int) -> int:
-        return 256 * self.pyboy.memory[start] + self.pyboy.memory[start + 1]
+    def _read_hp(self, addr: int) -> int:
+        """Read 16-bit HP value from memory."""
+        return 256 * self.pyboy.memory[addr] + self.pyboy.memory[addr + 1]
 
-    def _fourier_encode(self, val: float) -> np.ndarray:
-        return np.sin(val * 2 ** np.arange(8))
+    def _get_level_sum(self) -> int:
+        """Get sum of party Pokemon levels."""
+        return sum(self.pyboy.memory[addr] for addr in LEVEL_ADDRESSES)
 
-    def _get_levels_sum(self) -> int:
-        return sum(self.pyboy.memory[a] for a in [0xD18C, 0xD1B8, 0xD1E4, 0xD210, 0xD23C, 0xD268])
-
-    def _get_badges_binary(self) -> List[int]:
+    def _get_badges_list(self) -> List[int]:
+        """Get 8-element list of badge flags."""
         badge_byte = self.pyboy.memory[0xD356]
-        return [int(b) for b in f"{badge_byte:08b}"]
-
-    def _read_event_bits(self) -> List[int]:
-        # Truncate for performance? Reference reads ALL events.
-        # We will read 100 bytes from start
-        return [] # Placeholder to avoid large payload in observation for now, logic exists in reference
-
-    def _get_explore_map(self) -> np.ndarray:
-        # Return a window around current position
-        # Simplified for now
-        return np.zeros((10, 10, 1))
+        return [int(b) for b in f"{badge_byte:08b}"][::-1]
 
     def _is_in_battle(self) -> bool:
+        """Check if player is in battle."""
         return self.pyboy.memory[IS_IN_BATTLE_ADDR] != 0
 
-    def _read_tilemap_raw(self) -> np.ndarray:
-        return np.array([self.pyboy.memory[TILEMAP_START + i] for i in range(TILEMAP_SIZE)], dtype=np.uint8)
-
-    def _has_active_text(self) -> bool:
-        # Simplified heuristic
-        return self.pyboy.memory[TEXT_BOX_ID_ADDR] != 0
+    def _get_event_count(self) -> int:
+        """Count triggered event flags."""
+        count = 0
+        for addr in range(EVENT_FLAGS_START, EVENT_FLAGS_END):
+            count += self.pyboy.memory[addr].bit_count()
+        return count
 
     def _get_state_dict(self) -> Dict[str, Any]:
-        """Extract state dictionary for RewardManager."""
+        """Get current game state as dictionary for reward calculation."""
         return {
-            "event_count": self._get_event_count(),
             "seen_coords_count": len(self.seen_coords),
             "badge_count": self.pyboy.memory[0xD356].bit_count(),
-            "level_sum": self._get_levels_sum(),
+            "level_sum": self._get_level_sum(),
+            "event_count": self._get_event_count(),
+            "hp_fraction": self._get_hp_fraction(),
         }
 
-    def _get_event_count(self) -> int:
-        # Sum bits in event flag range
-        count = 0
-        for i in range(EVENT_FLAGS_START, EVENT_FLAGS_END):
-            count += self.pyboy.memory[i].bit_count()
-        return count
+    def _calculate_reward(
+        self, current: Dict[str, Any], previous: Dict[str, Any]
+    ) -> float:
+        """
+        Calculate reward based on state changes.
+        
+        Simple built-in reward shaping. For more complex reward functions,
+        see the rewards/ module for modular components.
+        """
+        if not previous:
+            return 0.0
+
+        reward = 0.0
+        
+        # Exploration reward
+        new_coords = current["seen_coords_count"] - previous.get("seen_coords_count", 0)
+        reward += new_coords * 0.02
+
+        # Badge reward
+        new_badges = current["badge_count"] - previous.get("badge_count", 0)
+        reward += new_badges * 5.0
+
+        # Level up reward
+        level_diff = current["level_sum"] - previous.get("level_sum", 0)
+        reward += max(0, level_diff) * 1.0
+
+        # Event progress reward
+        event_diff = current["event_count"] - previous.get("event_count", 0)
+        reward += max(0, event_diff) * 0.1
+
+        return reward * self.config.reward_scale
