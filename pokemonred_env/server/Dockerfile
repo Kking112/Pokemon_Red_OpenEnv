@@ -8,12 +8,17 @@
 # Builds a containerized PyBoy emulator environment for RL training
 #
 # Build: openenv build
-# Run:   docker run -p 8000:8000 pokemonred-env:latest
+#
+# Run (you must provide your own ROM file):
+#   docker run -p 8000:8000 -v /path/to/PokemonRed.gb:/rom/PokemonRed.gb pokemonred-env:latest
+#
+# The init.state file is included in the repository. Additional .state files
+# may be provided for starting at different points in the game.
 #
 # Environment variables:
 #   POKEMON_HEADLESS: Run without display (default: true)
 #   POKEMON_ACTION_FREQ: Emulator ticks per action (default: 24)
-#   POKEMON_ROM_PATH: Path to ROM file (default: /app/env/server/PokemonRed.gb)
+#   POKEMON_ROM_PATH: Path to ROM file (default: /rom/PokemonRed.gb)
 #   POKEMON_INIT_STATE: Path to save state (default: /app/env/server/init.state)
 
 ARG BASE_IMAGE=ghcr.io/meta-pytorch/openenv-base:latest
@@ -94,13 +99,17 @@ ENV SDL_AUDIODRIVER=dummy
 # Default environment configuration
 ENV POKEMON_HEADLESS=true
 ENV POKEMON_ACTION_FREQ=24
-ENV POKEMON_ROM_PATH=/app/env/server/PokemonRed.gb
+ENV POKEMON_ROM_PATH=/rom/PokemonRed.gb
 ENV POKEMON_INIT_STATE=/app/env/server/init.state
 ENV POKEMON_MAX_STEPS=163840
 ENV POKEMON_SESSION_PATH=/tmp/pokemon_sessions
 
-# Create session directory
-RUN mkdir -p /tmp/pokemon_sessions
+# Create directories
+RUN mkdir -p /tmp/pokemon_sessions /rom
+
+# VOLUME for user-provided ROM file
+# Users mount their ROM here: -v /path/to/PokemonRed.gb:/rom/PokemonRed.gb
+VOLUME /rom
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
