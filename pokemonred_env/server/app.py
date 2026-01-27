@@ -55,14 +55,28 @@ def create_pokemon_environment():
     
     This enables WebSocket session support where each client gets their own
     environment instance with isolated state.
+    
+    Auto-detects local vs Docker deployment:
+    - If POKEMON_ROM_PATH is set, uses environment variables (Docker/custom)
+    - Otherwise, uses paths relative to this file (local development)
     """
+    from pathlib import Path
+    
+    # Auto-detect server directory for local development
+    server_dir = Path(__file__).parent.resolve()
+    
+    # Default paths for local development (relative to server/)
+    default_rom_path = str(server_dir / "PokemonRed.gb")
+    default_init_state = str(server_dir / "has_pokedex.state")
+    default_session_path = str(server_dir.parent / "sessions")
+    
     config = PokemonRedConfig(
         headless=os.getenv("POKEMON_HEADLESS", "true").lower() == "true",
         action_freq=int(os.getenv("POKEMON_ACTION_FREQ", "24")),
-        gb_path=os.getenv("POKEMON_ROM_PATH", "/app/env/server/PokemonRed.gb"),
-        init_state=os.getenv("POKEMON_INIT_STATE", "/app/env/server/init.state"),
+        gb_path=os.getenv("POKEMON_ROM_PATH", default_rom_path),
+        init_state=os.getenv("POKEMON_INIT_STATE", default_init_state),
         max_steps=int(os.getenv("POKEMON_MAX_STEPS", "163840")),
-        session_path=os.getenv("POKEMON_SESSION_PATH", "/tmp/pokemon_sessions"),
+        session_path=os.getenv("POKEMON_SESSION_PATH", default_session_path),
     )
     return PokemonRedEnvironment(config)
 

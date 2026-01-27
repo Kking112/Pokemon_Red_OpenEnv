@@ -253,7 +253,7 @@ Configure the environment via environment variables:
 | `POKEMON_HEADLESS` | `true` | Run emulator without display |
 | `POKEMON_ACTION_FREQ` | `24` | Emulator ticks per action |
 | `POKEMON_ROM_PATH` | `/rom/PokemonRed.gb` | Path to ROM file (mount point) |
-| `POKEMON_INIT_STATE` | `/app/env/server/init.state` | Path to initial save state |
+| `POKEMON_INIT_STATE` | `/app/env/server/has_pokedex.state` | Path to initial save state |
 | `POKEMON_MAX_STEPS` | `163840` | Max steps per episode |
 | `POKEMON_SESSION_PATH` | `/tmp/pokemon_sessions` | Session data directory |
 

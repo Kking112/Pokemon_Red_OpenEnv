@@ -4,5 +4,6 @@
 """Wrappers for Pokemon Red OpenEnv environment."""
 
 from .green_agent import GreenAgentTracker
+from .frame_stack import FrameStackWrapper
 
-__all__ = ["GreenAgentTracker"]
+__all__ = ["GreenAgentTracker", "FrameStackWrapper"]
