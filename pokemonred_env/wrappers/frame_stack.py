@@ -120,12 +120,19 @@ class FrameStackWrapper:
     
     def _get_image(self, obs) -> Image.Image:
         """Extract PIL Image from observation."""
-        if hasattr(obs, 'image'):
+        if hasattr(obs, 'screen_b64') and obs.screen_b64:
+            import base64
+            from io import BytesIO
+            screen_bytes = base64.b64decode(obs.screen_b64)
+            return Image.open(BytesIO(screen_bytes))
+        elif hasattr(obs, 'image'):
             return obs.image
         elif hasattr(obs, 'screen'):
             return obs.screen
         else:
-            raise AttributeError("Observation has no 'image' or 'screen' attribute")
+            raise AttributeError(
+                "Observation has no 'screen_b64', 'image', or 'screen' attribute"
+            )
     
     def _add_stacked_image(self, obs) -> None:
         """Add stacked_image attribute to observation."""

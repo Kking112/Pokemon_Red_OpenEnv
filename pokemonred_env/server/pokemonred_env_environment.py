@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from PIL import Image
@@ -34,14 +35,30 @@ except ImportError as e:
 from openenv.core.env_server import Environment
 from openenv.core.env_server.types import Action, Observation
 
-from models import PokemonRedAction, PokemonRedObservation, PokemonRedState
-from config import PokemonRedConfig
+# Import resolution for both package and standalone modes
+import sys
+import os
+_is_package_mode = __name__.startswith("pokemonred_env.")
+
+if _is_package_mode:
+    try:
+        from ..models import PokemonRedAction, PokemonRedObservation, PokemonRedState
+        from ..config import PokemonRedConfig
+    except ImportError:
+        # Fallback if relative imports fail
+        from models import PokemonRedAction, PokemonRedObservation, PokemonRedState
+        from config import PokemonRedConfig
+else:
+    from models import PokemonRedAction, PokemonRedObservation, PokemonRedState
+    from config import PokemonRedConfig
+
 from .global_map import local_to_global, GLOBAL_MAP_SHAPE
 
 # Memory addresses for Pokemon Red
 EVENT_FLAGS_START = 0xD747
 EVENT_FLAGS_END = 0xD87E
 IS_IN_BATTLE_ADDR = 0xD057
+PARTY_SIZE_ADDR = 0xD163
 
 # Party Pokemon HP addresses
 HP_ADDRESSES = [0xD16C, 0xD198, 0xD1C4, 0xD1F0, 0xD21C, 0xD248]
@@ -120,6 +137,23 @@ class PokemonRedEnvironment(Environment):
         self.explore_map = np.zeros(GLOBAL_MAP_SHAPE, dtype=np.uint8)
         self._prev_state_dict: Dict[str, Any] = {}
 
+        # Initialize reward manager if configured
+        self.reward_manager: Optional[Any] = None
+        if config.use_modular_rewards:
+            from rewards import RewardManager
+            self.reward_manager = RewardManager(global_scale=config.reward_scale)
+            self.reward_manager.register_defaults({
+                "exploration_weight": config.exploration_weight,
+                "badge_weight": config.badge_weight,
+                "level_weight": config.level_weight,
+                "event_weight": config.event_weight,
+            })
+
+        # Load event mappings for detailed event tracking
+        events_path = Path(__file__).parent / "events.json"
+        with open(events_path) as f:
+            self._event_mappings: Dict[str, str] = json.load(f)
+
     def reset(self) -> Observation:
         """
         Reset the environment and return initial observation.
@@ -132,6 +166,10 @@ class PokemonRedEnvironment(Environment):
         self.seen_coords = {}
         self.explore_map.fill(0)
         self._prev_state_dict = {}
+
+        # Reset reward manager if enabled
+        if self.reward_manager:
+            self.reward_manager.reset()
 
         # Load initial save state
         with open(self.config.init_state, "rb") as f:
@@ -190,6 +228,8 @@ class PokemonRedEnvironment(Environment):
 
         # Check termination
         done = self._state.step_count >= self.config.max_steps
+        if self.config.terminate_on_blackout and self._check_blackout():
+            done = True
 
         return self._make_observation(reward=reward, done=done)
 
@@ -254,8 +294,11 @@ class PokemonRedEnvironment(Environment):
 
     def _get_hp_fraction(self) -> float:
         """Get party HP as fraction [0, 1]."""
-        hp_sum = sum(self._read_hp(addr) for addr in HP_ADDRESSES)
-        max_hp_sum = sum(self._read_hp(addr) for addr in MAX_HP_ADDRESSES)
+        party_size = min(self.pyboy.memory[PARTY_SIZE_ADDR], 6)
+        if party_size == 0:
+            return 0.0
+        hp_sum = sum(self._read_hp(HP_ADDRESSES[i]) for i in range(party_size))
+        max_hp_sum = sum(self._read_hp(MAX_HP_ADDRESSES[i]) for i in range(party_size))
         return hp_sum / max(max_hp_sum, 1)
 
     def _read_hp(self, addr: int) -> int:
@@ -264,7 +307,8 @@ class PokemonRedEnvironment(Environment):
 
     def _get_level_sum(self) -> int:
         """Get sum of party Pokemon levels."""
-        return sum(self.pyboy.memory[addr] for addr in LEVEL_ADDRESSES)
+        party_size = min(self.pyboy.memory[PARTY_SIZE_ADDR], 6)
+        return sum(self.pyboy.memory[LEVEL_ADDRESSES[i]] for i in range(party_size))
 
     def _get_badges_list(self) -> List[int]:
         """Get 8-element list of badge flags."""
@@ -275,6 +319,10 @@ class PokemonRedEnvironment(Environment):
         """Check if player is in battle."""
         return self.pyboy.memory[IS_IN_BATTLE_ADDR] != 0
 
+    def _check_blackout(self) -> bool:
+        """Check if player has blacked out (all Pokemon fainted outside battle)."""
+        return self._get_hp_fraction() == 0.0 and not self._is_in_battle()
+
     def _get_event_count(self) -> int:
         """Count triggered event flags."""
         count = 0
@@ -282,7 +330,26 @@ class PokemonRedEnvironment(Environment):
             count += self.pyboy.memory[addr].bit_count()
         return count
 
-    def _get_state_dict(self) -> Dict[str, Any]:
+    def _get_event_details(self) -> Dict[str, bool]:
+        """
+        Get detailed event flags with human-readable names.
+        
+        Returns:
+            Dictionary mapping event names to their triggered status.
+            Only includes named events (skips generic hex codes).
+        """
+        events = {}
+        for key, name in self._event_mappings.items():
+            # Skip unnamed events (generic hex codes like "0x123" or short codes)
+            if name.startswith("0x") or len(name) <= 3:
+                continue
+            addr_str, bit = key.split("-")
+            addr = int(addr_str, 16)
+            bit_pos = int(bit)
+            events[name] = bool(self.pyboy.memory[addr] & (1 << bit_pos))
+        return events
+
+    def _get_state_dict(self) -> Dict[str, Union[int, float]]:
         """Get current game state as dictionary for reward calculation."""
         return {
             "seen_coords_count": len(self.seen_coords),
@@ -301,6 +368,11 @@ class PokemonRedEnvironment(Environment):
         Simple built-in reward shaping. For more complex reward functions,
         see the rewards/ module for modular components.
         """
+        # Use modular reward manager if configured
+        if self.reward_manager:
+            return self.reward_manager.calculate(current, previous)
+        
+        # Fallback to built-in reward calculation
         if not previous:
             return 0.0
 
@@ -323,3 +395,49 @@ class PokemonRedEnvironment(Environment):
         reward += max(0, event_diff) * 0.1
 
         return reward * self.config.reward_scale
+
+    def export_state(self, path: Optional[str] = None) -> bytes:
+        """
+        Export current emulator state for checkpointing.
+        
+        Args:
+            path: Optional file path to save state to disk.
+        
+        Returns:
+            Raw state bytes.
+        """
+        buffer = io.BytesIO()
+        self.pyboy.save_state(buffer)
+        state_bytes = buffer.getvalue()
+        if path:
+            with open(path, 'wb') as f:
+                f.write(state_bytes)
+        return state_bytes
+
+    def import_state(self, state_bytes: bytes) -> None:
+        """
+        Import emulator state from bytes.
+        
+        Args:
+            state_bytes: Raw state bytes from export_state().
+        """
+        buffer = io.BytesIO(state_bytes)
+        self.pyboy.load_state(buffer)
+
+    def close(self) -> None:
+        """Clean up environment resources."""
+        if hasattr(self, 'pyboy') and self.pyboy is not None:
+            self.pyboy.stop()
+            self.pyboy = None
+
+    def __del__(self) -> None:
+        """Destructor to ensure cleanup on garbage collection."""
+        self.close()
+
+    def __enter__(self) -> "PokemonRedEnvironment":
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, *args) -> None:
+        """Context manager exit with cleanup."""
+        self.close()

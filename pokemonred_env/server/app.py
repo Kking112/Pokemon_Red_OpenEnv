@@ -33,17 +33,24 @@ Environment variables:
 """
 
 import os
+import sys
 
 from openenv.core.env_server import create_app
 
 # Support both package imports (when used as package) and direct imports (Docker/standalone)
-# Try relative imports first (package mode), fall back to absolute (Docker/standalone mode)
-try:
+# Determine runtime mode explicitly to avoid masking real import errors
+_is_package_mode = __name__.startswith("pokemonred_env.")
+
+if _is_package_mode:
+    # Package mode (imported as pokemonred_env.server.app)
     from ..models import PokemonRedAction, PokemonRedObservation
     from ..config import PokemonRedConfig
     from .pokemonred_env_environment import PokemonRedEnvironment
-except ImportError:
-    # Fallback for standalone loading (Docker, openenv validate, etc.)
+else:
+    # Standalone mode (Docker, openenv validate, uvicorn server.app:app)
+    _parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _parent_dir not in sys.path:
+        sys.path.insert(0, _parent_dir)
     from models import PokemonRedAction, PokemonRedObservation
     from config import PokemonRedConfig
     from server.pokemonred_env_environment import PokemonRedEnvironment

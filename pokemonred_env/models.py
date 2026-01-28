@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
 from openenv.core.env_server.types import Action, Observation, State
 
@@ -56,7 +56,17 @@ class PokemonRedObservation(Observation):
         in_battle: Whether player is currently in a battle.
         seen_coords_count: Number of unique coordinates visited (exploration metric).
         legal_actions: List of valid action indices.
+
+    Note:
+        The `done` and `reward` fields (inherited from base Observation) are included
+        for convenience when observations are used standalone. When using StepResult,
+        prefer StepResult.done and StepResult.reward as the authoritative values.
+        
+        Additional attributes (like `stacked_image` from FrameStackWrapper) can be
+        added dynamically via the 'extra' configuration.
     """
+
+    model_config = ConfigDict(extra='allow')
 
     screen_b64: str = Field(default="", description="Base64-encoded PNG frame")
     screen_shape: List[int] = Field(

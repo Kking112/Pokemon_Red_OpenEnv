@@ -16,11 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, TypeVar
 
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
+import psutil
 
 T = TypeVar("T")
 
@@ -93,10 +89,7 @@ class GreenAgentTracker:
                     Disable for benchmarking without overhead.
         """
         self.enabled = enabled
-        self._process: Optional[Any] = None
-        if HAS_PSUTIL:
-            self._process = psutil.Process(os.getpid())
-        
+        self._process = psutil.Process(os.getpid())
         self.reset()
     
     def reset(self) -> None:
@@ -173,18 +166,14 @@ class GreenAgentTracker:
     
     def _get_memory_mb(self) -> float:
         """Get current process memory in MB."""
-        if self._process is not None:
-            try:
-                return self._process.memory_info().rss / (1024 * 1024)
-            except Exception:
-                pass
-        return 0.0
+        try:
+            return self._process.memory_info().rss / (1024 * 1024)
+        except Exception:
+            return 0.0
     
     def _get_cpu_percent(self) -> float:
         """Get current CPU utilization percentage."""
-        if self._process is not None:
-            try:
-                return self._process.cpu_percent()
-            except Exception:
-                pass
-        return 0.0
+        try:
+            return self._process.cpu_percent()
+        except Exception:
+            return 0.0

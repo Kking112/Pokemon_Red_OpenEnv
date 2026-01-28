@@ -6,7 +6,9 @@ dist/
 wheels/
 *.egg-info
 Pokemon_Red_OpenEnv/pokemonred_env/server/PokemonRed.gb
+Agent_Demo/*
 
 # Virtual environments
 .venv
 .env
+Agent_Demo
